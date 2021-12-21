@@ -232,6 +232,8 @@ debug!("token = {}", token.token);
                            .await
                            .unwrap();
         debug!("Got manifest from docker.io, resp2status = {}",resp2.status());
+ let cnt = resp2.text().await.unwrap();
+debug!("got content: {}",cnt);
         }
         false
     }
