@@ -36,7 +36,7 @@ pub async fn handle_get_blobs(
         hash.get(7..9).unwrap(),
         hash.get(7..).unwrap()
     );
-    debug!("Searching for blob: {}", blob);
+    debug!("SEarching for blob: {}", blob);
     let blob_path = Path::new(&blob);
     if !blob_path.exists() {
         let mut send_message: String = "get_blobs | ".to_owned();

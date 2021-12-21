@@ -14,6 +14,8 @@
    limitations under the License.
 */
 
+extern crate reqwest;
+
 use super::{RegistryError, RegistryErrorCode};
 
 use bytes::Bytes;
@@ -23,8 +25,14 @@ use std::fs;
 use uuid::Uuid;
 use warp::http::StatusCode;
 use warp::{Rejection, Reply};
+use serde::{Deserialize, Serialize};
+use reqwest::get;
+use reqwest::header;
+// use hyper::header::{Headers, Authorization};
+
 
 pub async fn handle_get_manifests(name: String, tag: String) -> Result<impl Reply, Rejection> {
+debug!("GET MANIFEST! name = {}, tag = {}",name,tag);
     let colon = tag.find(':');
     let mut hash = String::from(&tag);
     if colon == None {
@@ -34,9 +42,12 @@ pub async fn handle_get_manifests(name: String, tag: String) -> Result<impl Repl
         );
         let manifest_content = fs::read_to_string(manifest);
         if manifest_content.is_err() {
-            return Err(warp::reject::custom(RegistryError {
-                code: RegistryErrorCode::ManifestUnknown,
-            }));
+            debug!("Manifest not found locally");
+            if !get_docker_manifest(name, tag).await {
+                return Err(warp::reject::custom(RegistryError {
+                    code: RegistryErrorCode::ManifestUnknown,
+                }));
+            }
         }
         hash = manifest_content.unwrap();
     }
@@ -71,6 +82,7 @@ pub async fn handle_put_manifest(
     bytes: Bytes,
 ) -> Result<impl Reply, Rejection> {
     let id = Uuid::new_v4();
+debug!("PUT MANIFEST! name = {}, ref = {}",name,reference);
 
     // temporary upload of manifest
     let blob_upload_dest_dir = format!(
@@ -187,3 +199,41 @@ pub async fn handle_put_manifest(
             .unwrap())
     }
 }
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct Bearer {
+    token: String,
+    expires_in: u64,
+}
+
+    pub async fn get_docker_manifest(name: String, tag: String) -> bool {
+        debug!("Get manifest from docker.io");
+        let url = format!("https://registry-1.docker.io/v2/library/{}/manifests/{}",
+                    name, tag);
+        debug!("Get manifest from docker.io with url {}", url);
+        let resp = reqwest::get(url).await.unwrap();
+        debug!("Got manifest from docker.io, status = {}",resp.status());
+        if (resp.status() == reqwest::StatusCode::UNAUTHORIZED) {
+            debug!("Got manifest from docker.io, but UNAUTHORIZED");
+            let auth_url =format!("https://auth.docker.io/token?client_id=Pyrsia&service=registry.docker.io&scope=repository:library/{}:pull", name);
+            // let auth_resp = reqwest::get(auth_url).await.unwrap();
+            // debug!("Got auth_response status = {}",auth_resp.status());
+            let token : Bearer = reqwest::get(auth_url).await
+                           .expect("error getting auth")
+                           .json().await
+                           .expect("wrong json");
+debug!("token = {}", token.token);
+        let url2 = format!("https://registry-1.docker.io/v2/library/{}/manifests/{}",
+                    name, tag);
+            let resp2 = reqwest::Client::new()
+                           .get(url2)
+                           .header(header::AUTHORIZATION, format!("Bearer {}", token.token))
+                           .send()
+                           .await
+                           .unwrap();
+        debug!("Got manifest from docker.io, resp2status = {}",resp2.status());
+        }
+        false
+    }
+
+
