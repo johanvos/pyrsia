@@ -20,19 +20,18 @@ use super::{RegistryError, RegistryErrorCode};
 
 use bytes::Bytes;
 use easy_hasher::easy_hasher::{file_hash, raw_sha256, Hash};
-use log::debug;
+use log::{debug, error, info};
+use reqwest::get;
+use reqwest::header;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use uuid::Uuid;
 use warp::http::StatusCode;
 use warp::{Rejection, Reply};
-use serde::{Deserialize, Serialize};
-use reqwest::get;
-use reqwest::header;
 // use hyper::header::{Headers, Authorization};
 
-
 pub async fn handle_get_manifests(name: String, tag: String) -> Result<impl Reply, Rejection> {
-debug!("GET MANIFEST! name = {}, tag = {}",name,tag);
+    debug!("GET MANIFEST! name = {}, tag = {}", name, tag);
     let colon = tag.find(':');
     let mut hash = String::from(&tag);
     if colon == None {
@@ -40,16 +39,29 @@ debug!("GET MANIFEST! name = {}, tag = {}",name,tag);
             "/tmp/registry/docker/registry/v2/repositories/{}/_manifests/tags/{}/current/link",
             name, tag
         );
+        debug!("manifest = {}", manifest);
+
         let manifest_content = fs::read_to_string(manifest);
         if manifest_content.is_err() {
             debug!("Manifest not found locally");
-            if !get_docker_manifest(name, tag).await {
-                return Err(warp::reject::custom(RegistryError {
-                    code: RegistryErrorCode::ManifestUnknown,
-                }));
+            let hash_from_docker_hub = get_docker_manifest(name, tag).await;
+            match hash_from_docker_hub {
+                Ok(hub_hash) => {
+                    info!("Downloaded manifest from docker.io {}", hub_hash);
+                    hash = hub_hash;
+                }
+                Err(e) => {
+                    return Err(warp::reject::custom(RegistryError {
+                        code: RegistryErrorCode::ManifestUnknown,
+                    }));
+                }
             }
+        } else {
+            info!("Manifest found locally {}", hash);
+
+            hash = manifest_content.unwrap();
         }
-        hash = manifest_content.unwrap();
+        debug!("HASH = {}", hash);
     }
 
     let blob = format!(
@@ -57,12 +69,15 @@ debug!("GET MANIFEST! name = {}, tag = {}",name,tag);
         hash.get(7..9).unwrap(),
         hash.get(7..).unwrap()
     );
+    debug!("BLOB = {}", blob);
     let blob_content = fs::read_to_string(blob);
     if blob_content.is_err() {
         return Err(warp::reject::custom(RegistryError {
             code: RegistryErrorCode::ManifestUnknown,
         }));
     }
+
+    debug!("Returning manifest");
 
     let content = blob_content.unwrap();
     return Ok(warp::http::response::Builder::new()
@@ -82,7 +97,7 @@ pub async fn handle_put_manifest(
     bytes: Bytes,
 ) -> Result<impl Reply, Rejection> {
     let id = Uuid::new_v4();
-debug!("PUT MANIFEST! name = {}, ref = {}",name,reference);
+    debug!("PUT MANIFEST! name = {}, ref = {}", name, reference);
 
     // temporary upload of manifest
     let blob_upload_dest_dir = format!(
@@ -99,7 +114,7 @@ debug!("PUT MANIFEST! name = {}, ref = {}",name,reference);
         "/tmp/registry/docker/registry/v2/repositories/{}/_uploads/{}/data",
         name, id
     );
-    let append = super::blobs::append_to_blob(&mut blob_upload_dest, bytes);
+    let append = super::blobs::append_to_blob(&mut blob_upload_dest, &bytes);
     if let Err(e) = append {
         return Err(warp::reject::custom(RegistryError {
             code: RegistryErrorCode::Unknown(e.to_string()),
@@ -206,36 +221,153 @@ struct Bearer {
     expires_in: u64,
 }
 
-    pub async fn get_docker_manifest(name: String, tag: String) -> bool {
-        debug!("Get manifest from docker.io");
-        let url = format!("https://registry-1.docker.io/v2/library/{}/manifests/{}",
-                    name, tag);
-        debug!("Get manifest from docker.io with url {}", url);
-        let resp = reqwest::get(url).await.unwrap();
-        debug!("Got manifest from docker.io, status = {}",resp.status());
-        if (resp.status() == reqwest::StatusCode::UNAUTHORIZED) {
-            debug!("Got manifest from docker.io, but UNAUTHORIZED");
-            let auth_url =format!("https://auth.docker.io/token?client_id=Pyrsia&service=registry.docker.io&scope=repository:library/{}:pull", name);
-            // let auth_resp = reqwest::get(auth_url).await.unwrap();
-            // debug!("Got auth_response status = {}",auth_resp.status());
-            let token : Bearer = reqwest::get(auth_url).await
-                           .expect("error getting auth")
-                           .json().await
-                           .expect("wrong json");
-debug!("token = {}", token.token);
-        let url2 = format!("https://registry-1.docker.io/v2/library/{}/manifests/{}",
-                    name, tag);
-            let resp2 = reqwest::Client::new()
-                           .get(url2)
-                           .header(header::AUTHORIZATION, format!("Bearer {}", token.token))
-                           .send()
-                           .await
-                           .unwrap();
-        debug!("Got manifest from docker.io, resp2status = {}",resp2.status());
- let cnt = resp2.text().await.unwrap();
-debug!("got content: {}",cnt);
+pub async fn get_docker_manifest(name: String, tag: String) -> Result<String, Rejection> {
+    debug!("Get manifest from docker.io");
+    let url = format!(
+        "https://registry-1.docker.io/v2/library/{}/manifests/{}",
+        name, tag
+    );
+    debug!("Get manifest from docker.io with url {}", url);
+    let resp = reqwest::get(url).await.unwrap();
+    //debug!("Got manifest from docker.io, status = {}",resp.status());
+    if (resp.status() == reqwest::StatusCode::UNAUTHORIZED) {
+        //debug!("Got manifest from docker.io, but UNAUTHORIZED");
+        let auth_url =format!("https://auth.docker.io/token?client_id=Pyrsia&service=registry.docker.io&scope=repository:library/{}:pull", name);
+        // let auth_resp = reqwest::get(auth_url).await.unwrap();
+        // debug!("Got auth_response status = {}",auth_resp.status());
+        let token: Bearer = reqwest::get(auth_url)
+            .await
+            .expect("error getting auth")
+            .json()
+            .await
+            .expect("wrong json");
+        //debug!("token = {}", token.token);
+
+        let url2 = format!(
+            "https://registry-1.docker.io/v2/library/{}/manifests/{}",
+            name, tag
+        );
+        let resp2 = reqwest::Client::new()
+            .get(url2)
+            .header(header::AUTHORIZATION, format!("Bearer {}", token.token))
+            .header(
+                "Accept",
+                "application/vnd.docker.distribution.manifest.v2+json",
+            )
+            .send()
+            .await
+            .unwrap();
+        debug!(
+            "Got manifest from docker.io, resp2status = {}",
+            resp2.status()
+        );
+        let cnt = resp2.text().await.unwrap();
+        debug!("got content: {}", cnt);
+
+        let id = Uuid::new_v4();
+        // temporary upload of manifest
+        let blob_upload_dest_dir = format!(
+            "/tmp/registry/docker/registry/v2/repositories/{}/_uploads/{}",
+            name, id
+        );
+        if let Err(e) = fs::create_dir_all(&blob_upload_dest_dir) {
+            return Err(warp::reject::custom(RegistryError {
+                code: RegistryErrorCode::Unknown(e.to_string()),
+            }));
         }
-        false
+
+        let mut blob_upload_dest = format!(
+            "/tmp/registry/docker/registry/v2/repositories/{}/_uploads/{}/data",
+            name, id
+        );
+        let bytes = Bytes::from(cnt);
+        let append = super::blobs::append_to_blob(&mut blob_upload_dest, &bytes);
+        if let Err(e) = append {
+            return Err(warp::reject::custom(RegistryError {
+                code: RegistryErrorCode::Unknown(e.to_string()),
+            }));
+        } else {
+            // calculate sha256 checksum on manifest file
+            let file256 = file_hash(raw_sha256, &blob_upload_dest);
+            let digest: Hash;
+            match file256 {
+                Ok(hash) => digest = hash,
+                Err(e) => {
+                    return Err(warp::reject::custom(RegistryError {
+                        code: RegistryErrorCode::Unknown(e.to_string()),
+                    }))
+                }
+            }
+
+            let hash = digest.to_hex_string();
+            debug!("Generated hash for manifest {}/{}: {}", name, tag, hash);
+            let mut blob_dest = format!(
+                "/tmp/registry/docker/registry/v2/blobs/sha256/{}/{}",
+                hash.get(0..2).unwrap(),
+                hash
+            );
+            if let Err(e) = fs::create_dir_all(&blob_dest) {
+                return Err(warp::reject::custom(RegistryError {
+                    code: RegistryErrorCode::Unknown(e.to_string()),
+                }));
+            }
+            blob_dest.push_str("/data");
+
+            // copy temporary upload to final blob location
+            if let Err(e) = fs::copy(&blob_upload_dest, &blob_dest) {
+                return Err(warp::reject::custom(RegistryError {
+                    code: RegistryErrorCode::Unknown(e.to_string()),
+                }));
+            }
+
+            // remove temporary files
+            if let Err(e) = fs::remove_dir_all(blob_upload_dest_dir) {
+                return Err(warp::reject::custom(RegistryError {
+                    code: RegistryErrorCode::Unknown(e.to_string()),
+                }));
+            }
+
+            // create manifest link file in revisions
+            let mut manifest_rev_dest = format!(
+                "/tmp/registry/docker/registry/v2/repositories/{}/_manifests/revisions/sha256/{}",
+                name, hash
+            );
+            if let Err(e) = fs::create_dir_all(&manifest_rev_dest) {
+                return Err(warp::reject::custom(RegistryError {
+                    code: RegistryErrorCode::Unknown(e.to_string()),
+                }));
+            }
+            manifest_rev_dest.push_str("/link");
+            if let Err(e) = fs::write(manifest_rev_dest, format!("sha256:{}", hash)) {
+                return Err(warp::reject::custom(RegistryError {
+                    code: RegistryErrorCode::Unknown(e.to_string()),
+                }));
+            }
+
+            // create manifest link file in tags if reference is a tag (no colon)
+            let colon = tag.find(':');
+            if let None = colon {
+                let mut manifest_tag_dest = format!(
+                    "/tmp/registry/docker/registry/v2/repositories/{}/_manifests/tags/{}/current",
+                    name, tag
+                );
+                if let Err(e) = fs::create_dir_all(&manifest_tag_dest) {
+                    return Err(warp::reject::custom(RegistryError {
+                        code: RegistryErrorCode::Unknown(e.to_string()),
+                    }));
+                }
+                manifest_tag_dest.push_str("/link");
+                if let Err(e) = fs::write(manifest_tag_dest, format!("sha256:{}", hash)) {
+                    return Err(warp::reject::custom(RegistryError {
+                        code: RegistryErrorCode::Unknown(e.to_string()),
+                    }));
+                }
+            }
+
+            return Ok(hash);
+        }
     }
-
-
+    return Err(warp::reject::custom(RegistryError {
+        code: RegistryErrorCode::Unknown("ERROR".to_string()),
+    }));
+}
