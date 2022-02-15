@@ -18,11 +18,13 @@ use super::handlers::*;
 use super::HashAlgorithm;
 use crate::docker::docker_hub_util::get_docker_hub_auth_token;
 use crate::docker::error_util::{RegistryError, RegistryErrorCode};
+use crate::network::p2p;
 use bytes::{Buf, Bytes};
+use futures::prelude::*;
 use futures::stream::{FusedStream, Stream};
 use futures::task::{Context, Poll};
-use log::{debug, error, info, trace};
-use reqwest::{header, Client};
+use log::{debug, info, trace};
+use reqwest::{header};
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
@@ -76,17 +78,15 @@ impl FusedStream for GetBlobsHandle {
 }
 
 pub async fn handle_get_blobs(
-    tx: GetBlobsHandle,
+    mut p2p_client: p2p::Client,
     _name: String,
     hash: String,
 ) -> Result<impl Reply, Rejection> {
-    let mut send_message: String = "get_blobs | ".to_owned();
-    let hash_clone: String = hash.clone();
-    send_message.push_str(&hash_clone);
-    tx.send(send_message.clone());
-
     debug!("Getting blob with hash : {:?}", hash);
     let blob_content;
+
+    let peer_ids = p2p_client.get_peer_ids().await;
+    info!("Reading blob from other peers: {:?}", peer_ids);
 
     match get_artifact(
         hex::decode(&hash.get(7..).unwrap()).unwrap().as_ref(),
@@ -100,6 +100,28 @@ pub async fn handle_get_blobs(
             blob_content = content;
         }
         Err(error) => {
+            // Request the content of the artifact from each node.
+            // let peer_ids = p2p_client.get_peer_ids().await;
+            // info!("Reading blob from other peers: {:?}", peer_ids);
+            if !peer_ids.is_empty() {
+                let hash_copy = &hash.clone();
+                let requests = peer_ids.into_iter().map(|peer_id| {
+                    let mut p2p_client = p2p_client.clone();
+                    async move { p2p_client.request_artifact(peer_id, String::from(&hash_copy.clone())).await }.boxed()
+                });
+
+                let file = futures::future::select_ok(requests)
+                    .await
+                    .map_err(|e| {
+                        info!("ERRORED: {}", e);
+                        warp::reject::custom(RegistryError {
+                            code: RegistryErrorCode::BlobUnknown,
+                        })
+                    })?
+                    .0;
+                info!("GOT FILE: {:?}", file);
+            }
+
             info!("Reading blob from dockerhub: {}", hash.get(7..).unwrap());
             debug!(
                 "Error while fetching artifact from Pyrsia, so fetching from dockerhub: {}",
@@ -132,16 +154,9 @@ pub async fn handle_get_blobs(
 }
 
 pub async fn handle_post_blob(
-    tx: tokio::sync::mpsc::Sender<String>,
     name: String,
 ) -> Result<impl Reply, Rejection> {
     let id = Uuid::new_v4();
-
-    // These need to be advertised?
-    match tx.send(name.clone()).await {
-        Ok(_) => debug!("name sent"),
-        Err(_) => error!("failed to send name"),
-    }
 
     trace!(
         "Getting ready to start new upload for {} - {}",
@@ -294,7 +309,7 @@ async fn get_blob_from_docker_hub_with_token(
         name, hash
     );
     debug!("Reading blob from docker.io with url: {}", url);
-    let response = Client::new()
+    let response = reqwest::Client::new()
         .get(url)
         .header(header::AUTHORIZATION, format!("Bearer {}", token))
         .send()

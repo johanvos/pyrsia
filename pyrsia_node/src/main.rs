@@ -23,22 +23,18 @@ extern crate pyrsia;
 extern crate tokio;
 extern crate warp;
 
+use pyrsia::artifact_manager::HashAlgorithm;
 use pyrsia::docker::error_util::*;
-use pyrsia::docker::v2::handlers::blobs::GetBlobsHandle;
 use pyrsia::docker::v2::routes::*;
-use pyrsia::document_store::document_store::DocumentStore;
-use pyrsia::document_store::document_store::IndexSpec;
 use pyrsia::logging::*;
-use pyrsia::network::swarm::{self, MyBehaviourSwarm};
-use pyrsia::network::transport::{new_tokio_tcp_transport, TcpTokioTransport};
+use pyrsia::network::p2p::{self};
 use pyrsia::node_api::routes::make_node_routes;
+use pyrsia::node_manager::handlers::get_artifact;
 
 use clap::{App, Arg, ArgMatches};
 use futures::StreamExt;
 use libp2p::{
-    core::identity,
-    floodsub::{self, Topic},
-    swarm::SwarmEvent,
+    multiaddr::Protocol,
     Multiaddr, PeerId,
 };
 use log::{debug, error, info};
@@ -48,8 +44,7 @@ use std::{
     sync::Arc,
 };
 use tokio::{
-    io::{self, AsyncBufReadExt},
-    sync::{mpsc, Mutex, MutexGuard},
+    sync::{mpsc, Mutex},
 };
 use warp::Filter;
 
@@ -59,11 +54,6 @@ const DEFAULT_PORT: &str = "7888";
 #[tokio::main]
 async fn main() {
     pretty_env_logger::init();
-
-    // create the connection to the documentStore.
-    let index_one = "index_one";
-    let field1 = "most_significant_field";
-    let idx1 = IndexSpec::new(index_one, vec![field1]);
 
     let matches: ArgMatches = App::new("Pyrsia Node")
         .version("0.1.0")
@@ -77,7 +67,7 @@ async fn main() {
                 .default_value(DEFAULT_HOST)
                 .takes_value(true)
                 .required(false)
-                .multiple(false)
+                .multiple_occurrences(false)
                 .help("Sets the host address to bind to for the Docker API"),
         )
         .arg(
@@ -88,56 +78,45 @@ async fn main() {
                 .default_value(DEFAULT_PORT)
                 .takes_value(true)
                 .required(false)
-                .multiple(false)
+                .multiple_occurrences(false)
                 .help("Sets the port to listen to for the Docker API"),
         )
         .arg(
             Arg::new("peer")
-                //.short("p")
+                .short('P')
                 .long("peer")
                 .takes_value(true)
                 .required(false)
-                .multiple(false)
+                .multiple_occurrences(false)
                 .help("Provide an explicit peerId to connect with"),
         )
         .get_matches();
 
-    let local_key: identity::Keypair = identity::Keypair::generate_ed25519();
+    let (mut p2p_client, mut p2p_events, event_loop) = p2p::new().await.unwrap();
 
-    let local_peer_id = PeerId::from(local_key.public());
-    let transport: TcpTokioTransport = new_tokio_tcp_transport(&local_key); // Create a tokio-based TCP transport using noise for authenticated
-
-    let (respond_tx, respond_rx) = mpsc::channel(32);
-    let floodsub_topic: Topic = floodsub::Topic::new("pyrsia_node_converstation");
-    let gossip_topic: libp2p::gossipsub::IdentTopic =
-        libp2p::gossipsub::IdentTopic::new("pyrsia_file_share_topic");
-
-    // Create a Swarm to manage peers and events.
-    let mut swarm: MyBehaviourSwarm = swarm::new(
-        gossip_topic.clone(),
-        floodsub_topic.clone(),
-        transport,
-        &local_key,
-        local_peer_id,
-        respond_tx,
-    )
-    .await
-    .unwrap();
+    tokio::spawn(event_loop.run());
 
     // Reach out to another node if specified
     if let Some(to_dial) = matches.value_of("peer") {
         let addr: Multiaddr = to_dial.parse().unwrap();
-        swarm.dial(addr).unwrap();
-        info!("Dialed {:?}", to_dial)
+        let peer_id = match addr.iter().last() {
+            Some(Protocol::P2p(hash)) => Ok(PeerId::from_multihash(hash).expect("Valid hash.")),
+            _ => Err("Expect peer multiaddr to contain peer ID."),
+        };
+        match peer_id {
+            Ok(peer_id) => {
+                p2p_client.dial(peer_id, addr).await.expect("Dial to succeed.");
+                info!("Dialed {:?}", to_dial)
+            },
+            Err(e) => error!("Failed to dial peer: {}", e)
+        }        
     }
 
-    // Read full lines from stdin
-    let mut stdin = io::BufReader::new(io::stdin()).lines();
-
     // Listen on all interfaces and whatever port the OS assigns
-    swarm
-        .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
-        .unwrap();
+    p2p_client
+        .listen("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+        .await
+        .expect("Listening should not fail");
 
     // Get host and port from the settings. Defaults to DEFAULT_HOST and DEFAULT_PORT
     let host = matches.value_of("host").unwrap();
@@ -152,22 +131,12 @@ async fn main() {
         port.parse::<u16>().unwrap(),
     );
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (respond_tx, respond_rx) = mpsc::channel(32);
+    // let (tx, mut rx) = mpsc::channel(32);
 
-    let mut blobs_need_hash = GetBlobsHandle::new();
-    let b1 = blobs_need_hash.clone();
-    //docker node specific tx
-    let tx1 = tx.clone();
-
-    // swarm specific tx,rx
-    // need better handling of all these channel resources
-    let shared_stats = Arc::new(Mutex::new(respond_rx));
-
-    let my_stats = shared_stats.clone();
-    let tx2 = tx.clone();
-
-    let docker_routes = make_docker_routes(b1, tx1);
-    let routes = docker_routes.or(make_node_routes(tx2, my_stats));
+    let p2p_client_2 = p2p_client.clone();
+    let docker_routes = make_docker_routes(p2p_client_2);
+    let routes = docker_routes.or(make_node_routes(respond_tx, Arc::new(Mutex::new(respond_rx))));
 
     let (addr, server) = warp::serve(
         routes
@@ -184,75 +153,21 @@ async fn main() {
     );
 
     tokio::spawn(server);
-    let tx4 = tx.clone();
 
-    // Kick it off
     loop {
-        let evt = {
-            tokio::select! {
-                line = stdin.next_line() => Some(EventType::Input(line.expect("can get line").expect("can read line from stdin"))),
-                message = rx.recv() => Some(EventType::Message(message.expect("message exists"))),
-
-                new_hash = blobs_need_hash.select_next_some() => {
-                    debug!("Looking for {}", new_hash);
-                    swarm.behaviour_mut().lookup_blob(new_hash).await;
-                    None
-                },
-
-                event = swarm.select_next_some() =>  {
-                    if let SwarmEvent::NewListenAddr { address, .. } = event {
-                        info!("Listening on {:?}", address);
-                    }
-
-                    //SwarmEvent::Behaviour(e) => panic!("Unexpected event: {:?}", e),
-                    None
-                },
-
-            }
-        };
-
-        if let Some(event) = evt {
+        if let Some(event) = p2p_events.next().await {
             match event {
-                EventType::Response(resp) => {
-                    //here we have to manage which events to publish to floodsub
-                    swarm
-                        .behaviour_mut()
-                        .floodsub_mut()
-                        .publish(floodsub_topic.clone(), resp.as_bytes());
+                // Reply with the content of the artifact on incoming requests.
+                pyrsia::network::p2p::Event::InboundRequest { hash, channel } => {
+                    match get_artifact(
+                        hex::decode(&hash.get(7..).unwrap()).unwrap().as_ref(),
+                        HashAlgorithm::SHA256,
+                    ) {
+                        Ok(content) => p2p_client.respond_artifact(content, channel).await,
+                        _ => info!("This node does not provide artifact {}", hash),
+                    }
                 }
-                EventType::Input(line) => match line.as_str() {
-                    "peers" => swarm.behaviour_mut().list_peers_cmd().await,
-                    cmd if cmd.starts_with("magnet:") => {
-                        info!(
-                            "{}",
-                            swarm
-                                .behaviour_mut()
-                                .gossipsub_mut()
-                                .publish(gossip_topic.clone(), cmd)
-                                .unwrap()
-                        )
-                    }
-                    _ => match tx4.send(line).await {
-                        Ok(_) => debug!("line sent"),
-                        Err(_) => error!("failed to send stdin input"),
-                    },
-                },
-                EventType::Message(message) => match message.as_str() {
-                    cmd if cmd.starts_with("peers") || cmd.starts_with("status") => {
-                        swarm.behaviour_mut().list_peers(local_peer_id).await
-                    }
-                    cmd if cmd.starts_with("get_blobs") => {
-                        swarm.behaviour_mut().lookup_blob(message).await
-                    }
-                    _ => info!("message received from peers: {}", message),
-                },
             }
         }
-    }
-}
-
-enum EventType {
-    Response(String),
-    Message(String),
-    Input(String),
+    };
 }

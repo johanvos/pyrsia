@@ -1,5 +1,5 @@
 services:
-  pyrsia:
+  pyrsia1:
     image: pyrsia/node
     build:
       context: .
@@ -9,7 +9,19 @@ services:
     ports:
       - "7888:7888"
     volumes:
-      - "pyrsia:/tmp"
+      - "pyrsia1:/tmp"
+  pyrsia2:
+    image: pyrsia/node
+    build:
+      context: .
+      target: node
+    command: ["-H" , "0.0.0.0", "-p", "7889"]
+    stdin_open: true
+    ports:
+      - "7889:7889"
+    volumes:
+      - "pyrsia2:/tmp"
 
 volumes:
-  pyrsia:
+  pyrsia1:
+  pyrsia2:
