@@ -23,6 +23,8 @@ COPY --from=dupdatelock /src/Cargo.lock .
 FROM builder AS dbuild
 RUN mkdir -p /out
 ENV RUST_BACKTRACE=1
+ENV DEV_MODE=on 
+ENV PYRSIA_ARTIFACT_PATH=pyrsia
 RUN --mount=target=/src \
     --mount=type=cache,target=/target \
     --mount=type=cache,target=/usr/local/cargo/git/db \
@@ -33,6 +35,8 @@ RUN --mount=target=/src \
 FROM debian:buster-slim AS node
 ENTRYPOINT ["pyrsia_node"]
 ENV RUST_LOG=info,pyrsia=debug,libp2p_core=debug,libp2p_tcp=debug,reqwest=debug,hyper=debug
+ENV DEV_MODE=on
+ENV PYRSIA_ARTIFACT_PATH=pyrsia
 RUN <<EOT bash
     set -e
     apt-get update

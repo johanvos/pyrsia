@@ -17,8 +17,21 @@
 use super::{RegistryError, RegistryErrorCode};
 use crate::network::p2p;
 use crate::node_manager::{handlers::*, model::cli::Status};
-use log::{debug};
+use log::{debug, error};
 use warp::{http::StatusCode, Rejection, Reply};
+
+pub async fn handle_add_magnet(mut p2p_client: p2p::Client) -> Result<impl Reply, Rejection> {
+    match p2p_client.add_magnet(String::from("magnet")).await {
+        Ok(_) => debug!("request for magnet sent"),
+        Err(_) => error!("failed to send magnet"),
+    }
+    debug!("Got magnet link");
+    Ok(warp::http::response::Builder::new()
+        .header("Content-Type", "application/octet-stream")
+        .status(StatusCode::OK)
+        .body("Successfully sent magnet link")
+        .unwrap())
+}
 
 pub async fn handle_get_peers(
     mut p2p_client: p2p::Client,
@@ -48,7 +61,7 @@ pub async fn handle_get_status(
         }));
     }
 
-    let disk_space_result = disk_usage(ARTIFACTS_DIR);
+    let disk_space_result = disk_usage(ARTIFACTS_DIR.as_str());
     if disk_space_result.is_err() {
         return Err(warp::reject::custom(RegistryError {
             code: RegistryErrorCode::Unknown(disk_space_result.err().unwrap().to_string()),

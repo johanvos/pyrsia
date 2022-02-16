@@ -31,7 +31,6 @@ use libp2p::request_response::{
     RequestResponseMessage, ResponseChannel,
 };
 use libp2p::swarm::{ProtocolsHandlerUpgrErr, SwarmBuilder, SwarmEvent};
-use rand::Rng;
 use std::collections::HashMap;
 use std::error::Error;
 use std::iter;
@@ -97,6 +96,15 @@ impl Client {
         let (sender, receiver) = oneshot::channel();
         self.sender
             .send(Command::ListPeers { peer_id: self.local_peer_id, sender })
+            .await
+            .expect("Command receiver not to be dropped.");
+        receiver.await.expect("Sender not to be dropped.")
+    }
+
+    pub async fn add_magnet(&mut self, magnet: String) -> Result<(), Box<dyn Error + Send>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::AddMagnet { magnet, sender })
             .await
             .expect("Command receiver not to be dropped.");
         receiver.await.expect("Sender not to be dropped.")
@@ -307,6 +315,12 @@ impl EventLoop {
                     .get_closest_peers(peer_id);
                 self.pending_list_peers.insert(query_id, sender);
             }
+            Command::AddMagnet {
+                magnet,
+                sender,
+            } => {
+                sender.send(Ok(())).expect("Connection to peer to still be open.");
+            }
             Command::LookupBlob {
                 hash,
                 sender,
@@ -375,6 +389,10 @@ enum Command {
     ListPeers {
         peer_id: PeerId,
         sender: oneshot::Sender<Vec<PeerId>>,
+    },
+    AddMagnet {
+        magnet: String,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>,
     },
     LookupBlob {
         hash: String,
