@@ -20,9 +20,9 @@ use crate::docker::docker_hub_util::get_docker_hub_auth_token;
 use crate::docker::error_util::{RegistryError, RegistryErrorCode};
 use crate::network::p2p;
 use bytes::{Buf, Bytes};
-use futures::prelude::*;
 use futures::stream::{FusedStream, Stream};
 use futures::task::{Context, Poll};
+use libp2p::PeerId;
 use log::{debug, info, trace};
 use reqwest::{header};
 use std::collections::HashMap;
@@ -78,15 +78,13 @@ impl FusedStream for GetBlobsHandle {
 }
 
 pub async fn handle_get_blobs(
-    mut p2p_client: p2p::Client,
-    _name: String,
+    p2p_client: p2p::Client,
+    peer_id: Option<PeerId>,
+    name: String,
     hash: String,
 ) -> Result<impl Reply, Rejection> {
     debug!("Getting blob with hash : {:?}", hash);
     let blob_content;
-
-    let peer_ids = p2p_client.get_peer_ids().await;
-    info!("Reading blob from other peers: {:?}", peer_ids);
 
     match get_artifact(
         hex::decode(&hash.get(7..).unwrap()).unwrap().as_ref(),
@@ -100,35 +98,14 @@ pub async fn handle_get_blobs(
             blob_content = content;
         }
         Err(error) => {
-            // Request the content of the artifact from each node.
-            // let peer_ids = p2p_client.get_peer_ids().await;
-            // info!("Reading blob from other peers: {:?}", peer_ids);
-            if !peer_ids.is_empty() {
-                let hash_copy = &hash.clone();
-                let requests = peer_ids.into_iter().map(|peer_id| {
-                    let mut p2p_client = p2p_client.clone();
-                    async move { p2p_client.request_artifact(peer_id, String::from(&hash_copy.clone())).await }.boxed()
-                });
-
-                let file = futures::future::select_ok(requests)
-                    .await
-                    .map_err(|e| {
-                        info!("ERRORED: {}", e);
-                        warp::reject::custom(RegistryError {
-                            code: RegistryErrorCode::BlobUnknown,
-                        })
-                    })?
-                    .0;
-                info!("GOT FILE: {:?}", file);
-            }
-
-            info!("Reading blob from dockerhub: {}", hash.get(7..).unwrap());
+            info!("Reading blob from elsewhere: {}", hash.get(7..).unwrap());
             debug!(
-                "Error while fetching artifact from Pyrsia, so fetching from dockerhub: {}",
+                "Error while fetching artifact from local Pyrsia, so fetching from elsewhere: {}",
                 error.to_string()
             );
-            let blob_push = get_blob_from_docker_hub(&_name, &hash).await?;
-            if blob_push {
+
+            let blob_stored = get_blob_from_elsewhere(p2p_client, peer_id, &name, &hash).await?;
+            if blob_stored {
                 blob_content = get_artifact(
                     hex::decode(&hash.get(7..).unwrap()).unwrap().as_ref(),
                     HashAlgorithm::SHA256,
@@ -250,11 +227,13 @@ pub fn append_to_blob(blob: &str, mut bytes: Bytes) -> std::io::Result<(u64, u64
     Ok((initial_file_length, total_bytes_read))
 }
 
-fn create_upload_directory(name: &str, id: &str) -> std::io::Result<()> {
-    fs::create_dir_all(format!(
+fn create_upload_directory(name: &str, id: &str) -> std::io::Result<String> {
+    let upload_directory = format!(
         "/tmp/registry/docker/registry/v2/repositories/{}/_uploads/{}",
         name, id
-    ))
+    );
+    fs::create_dir_all(&upload_directory)?;
+    Ok(upload_directory)
 }
 
 fn store_blob_in_filesystem(
@@ -263,10 +242,7 @@ fn store_blob_in_filesystem(
     digest: &str,
     bytes: Bytes,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let blob_upload_dest_dir = format!(
-        "/tmp/registry/docker/registry/v2/repositories/{}/_uploads/{}",
-        name, id
-    );
+    let blob_upload_dest_dir = create_upload_directory(name, &id.to_string())?;
     let mut blob_upload_dest_data = blob_upload_dest_dir.clone();
     blob_upload_dest_data.push_str("/data");
     let append = append_to_blob(&blob_upload_dest_data, bytes)?;
@@ -291,6 +267,49 @@ fn store_blob_in_filesystem(
     fs::remove_dir_all(&blob_upload_dest_dir)?;
 
     Ok(push_result)
+}
+
+async fn get_blob_from_elsewhere(p2p_client: p2p::Client, peer_id: Option<PeerId>, name: &str, hash: &str) -> Result<bool, Rejection> {
+    let mut blob_stored = get_blob_from_other_peer(p2p_client.clone(), peer_id, name, hash).await;
+
+    if !blob_stored {
+        info!("Reading blob from dockerhub: {}", hash.get(7..).unwrap());
+
+        blob_stored = get_blob_from_docker_hub(name, hash).await?;
+    }
+
+    Ok(blob_stored)
+}
+
+// Request the content of the artifact from other peer
+async fn get_blob_from_other_peer(mut p2p_client: p2p::Client, peer_id: Option<PeerId>, name: &str, hash: &str) -> bool {
+    let mut blob_stored = false;
+    if let Some(peer_id) = peer_id {
+        info!("Reading blob from Pyrsia Node {}: {}", peer_id, hash.get(7..).unwrap());
+        blob_stored = match p2p_client.request_artifact(peer_id, String::from(hash)).await {
+            Ok(artifact) => {
+                let id = Uuid::new_v4();
+                match store_blob_in_filesystem(name, &id.to_string(), hash, bytes::Bytes::from(artifact)) {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        debug!(
+                            "Error while storing artifact in filesystem: {:?}",
+                            error
+                        );
+                        false
+                    }
+                }
+            },
+            Err(error) => {
+                debug!(
+                    "Error while fetching artifact from Pyrsia Node, so fetching from dockerhub: {:?}",
+                    error
+                );
+                false
+            }
+        };
+    }
+    blob_stored
 }
 
 async fn get_blob_from_docker_hub(name: &str, hash: &str) -> Result<bool, Rejection> {
@@ -320,9 +339,6 @@ async fn get_blob_from_docker_hub_with_token(
     let bytes = response.bytes().await.map_err(RegistryError::from)?;
 
     let id = Uuid::new_v4();
-
-    create_upload_directory(name, &id.to_string()).map_err(RegistryError::from)?;
-
     let blob_push = store_blob_in_filesystem(name, &id.to_string(), hash, bytes)
         .map_err(RegistryError::from)?;
 

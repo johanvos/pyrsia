@@ -31,6 +31,7 @@ use pyrsia::network::p2p::{self};
 use pyrsia::node_api::routes::make_node_routes;
 use pyrsia::node_manager::handlers::get_artifact;
 
+use async_std::task::spawn;
 use clap::{App, Arg, ArgMatches};
 use futures::StreamExt;
 use libp2p::{
@@ -94,9 +95,10 @@ async fn main() {
 
     let (mut p2p_client, mut p2p_events, event_loop) = p2p::new().await.unwrap();
 
-    tokio::spawn(event_loop.run());
+    spawn(event_loop.run());
 
     // Reach out to another node if specified
+    let mut final_peer_id: Option<PeerId> = None;
     if let Some(to_dial) = matches.value_of("peer") {
         let addr: Multiaddr = to_dial.parse().unwrap();
         let peer_id = match addr.iter().last() {
@@ -105,11 +107,12 @@ async fn main() {
         };
         match peer_id {
             Ok(peer_id) => {
+                final_peer_id = Some(peer_id);
                 p2p_client.dial(peer_id, addr).await.expect("Dial to succeed.");
                 info!("Dialed {:?}", to_dial)
             },
             Err(e) => error!("Failed to dial peer: {}", e)
-        }        
+        };
     }
 
     // Listen on all interfaces and whatever port the OS assigns
@@ -131,12 +134,8 @@ async fn main() {
         port.parse::<u16>().unwrap(),
     );
 
-    let (respond_tx, respond_rx) = mpsc::channel(32);
-    // let (tx, mut rx) = mpsc::channel(32);
-
-    let p2p_client_2 = p2p_client.clone();
-    let docker_routes = make_docker_routes(p2p_client_2);
-    let routes = docker_routes.or(make_node_routes(respond_tx, Arc::new(Mutex::new(respond_rx))));
+    let docker_routes = make_docker_routes(p2p_client.clone(), final_peer_id);
+    let routes = docker_routes.or(make_node_routes(p2p_client.clone()));
 
     let (addr, server) = warp::serve(
         routes

@@ -23,16 +23,16 @@ use libp2p::core::{Multiaddr, PeerId};
 use libp2p::core::either::EitherError;
 use libp2p::core::upgrade::{read_length_prefixed, write_length_prefixed, ProtocolName};
 use libp2p::identity;
-use libp2p::kad::{GetProvidersOk, Kademlia, KademliaEvent, QueryId, QueryResult};
+use libp2p::kad::{GetClosestPeersOk, Kademlia, KademliaEvent, QueryId, QueryResult};
 use libp2p::kad::record::store::MemoryStore;
-use libp2p::mdns::{Mdns, MdnsEvent};
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{
     ProtocolSupport, RequestId, RequestResponse, RequestResponseCodec, RequestResponseEvent,
     RequestResponseMessage, ResponseChannel,
 };
 use libp2p::swarm::{ProtocolsHandlerUpgrErr, SwarmBuilder, SwarmEvent};
-use std::collections::{HashMap, HashSet};
+use rand::Rng;
+use std::collections::HashMap;
 use std::error::Error;
 use std::iter;
 
@@ -41,13 +41,10 @@ pub async fn new() -> Result<(Client, impl Stream<Item = Event>, EventLoop), Box
 
     let local_peer_id = local_keys.public().to_peer_id();
 
-    let mdns = Mdns::new(Default::default()).await.unwrap();
-
     let swarm = SwarmBuilder::new(
         libp2p::development_transport(local_keys).await?,
         ComposedBehaviour {
             kademlia: Kademlia::new(local_peer_id, MemoryStore::new(local_peer_id)),
-            mdns: mdns,
             request_response: RequestResponse::new(
                 FileExchangeCodec(),
                 iter::once((FileExchangeProtocol(), ProtocolSupport::Full)),
@@ -58,12 +55,13 @@ pub async fn new() -> Result<(Client, impl Stream<Item = Event>, EventLoop), Box
     )
     .build();
 
-    let (command_sender, command_receiver) = mpsc::channel(0);
-    let (event_sender, event_receiver) = mpsc::channel(0);
+    let (command_sender, command_receiver) = mpsc::channel(32);
+    let (event_sender, event_receiver) = mpsc::channel(32);
 
     Ok((
         Client {
             sender: command_sender,
+            local_peer_id,
         },
         event_receiver,
         EventLoop::new(swarm, command_receiver, event_sender)
@@ -73,43 +71,53 @@ pub async fn new() -> Result<(Client, impl Stream<Item = Event>, EventLoop), Box
 #[derive(Clone)]
 pub struct Client {
     sender: mpsc::Sender<Command>,
+    pub local_peer_id: PeerId,
 }
 
 impl Client {
     pub async fn listen(&mut self, addr: Multiaddr) -> Result<(), Box<dyn Error + Send>> {
-        let (tx, rx) = oneshot::channel();
+        let (sender, receiver) = oneshot::channel();
         self.sender
-            .send(Command::Listen { addr, sender: tx })
+            .send(Command::Listen { addr, sender })
             .await
             .expect("Command receiver not to be dropped.");
-        rx.await.expect("Sender not to be dropped.")
+        receiver.await.expect("Sender not to be dropped.")
     }
 
     pub async fn dial(&mut self, peer_id: PeerId, peer_addr: Multiaddr) -> Result<(), Box<dyn Error + Send>> {
-        let (tx, rx) = oneshot::channel();
+        let (sender, receiver) = oneshot::channel();
         self.sender
-            .send(Command::Dial { peer_id, peer_addr, sender: tx })
+            .send(Command::Dial { peer_id, peer_addr, sender })
             .await
             .expect("Command receiver not to be dropped.");
-        rx.await.expect("Sender not to be dropped.")
+        receiver.await.expect("Sender not to be dropped.")
     }
 
-    pub async fn get_peer_ids(&mut self) -> HashSet<PeerId> {
-        let (tx, rx) = oneshot::channel();
+    pub async fn list_peers(&mut self) -> Vec<PeerId> {
+        let (sender, receiver) = oneshot::channel();
         self.sender
-            .send(Command::GetPeerIds { sender: tx })
+            .send(Command::ListPeers { peer_id: self.local_peer_id, sender })
             .await
             .expect("Command receiver not to be dropped.");
-        rx.await.expect("Sender not to be dropped.")
+        receiver.await.expect("Sender not to be dropped.")
+    }
+
+    pub async fn lookup_blob(&mut self, hash: String) -> Result<(), Box<dyn Error + Send>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::LookupBlob { hash, sender })
+            .await
+            .expect("Command receiver not to be dropped.");
+        receiver.await.expect("Sender not to be dropped.")
     }
 
     pub async fn request_artifact(&mut self, peer: PeerId, hash: String) -> Result<Vec<u8>, Box<dyn Error + Send>> {
-        let (tx, rx) = oneshot::channel();
+        let (sender, receiver) = oneshot::channel();
         self.sender
-            .send(Command::RequestArtifact { hash, peer, sender: tx })
+            .send(Command::RequestArtifact { hash, peer, sender })
             .await
             .expect("Command receiver not to be dropped.");
-        rx.await.expect("Sender not to be dropped.")
+        receiver.await.expect("Sender not to be dropped.")
     }
 
     pub async fn respond_artifact(&mut self, artifact: Vec<u8>, channel: ResponseChannel<ArtifactResponse>) {
@@ -124,10 +132,8 @@ pub struct EventLoop {
     swarm: Swarm<ComposedBehaviour>,
     command_receiver: mpsc::Receiver<Command>,
     event_sender: mpsc::Sender<Event>,
-    discovered_peers: HashSet<PeerId>,
     pending_dial: HashMap<PeerId, oneshot::Sender<Result<(), Box<dyn Error + Send>>>>,
-    pending_start_providing: HashMap<QueryId, oneshot::Sender<()>>,
-    pending_get_providers: HashMap<QueryId, oneshot::Sender<HashSet<PeerId>>>,
+    pending_list_peers: HashMap<QueryId, oneshot::Sender<Vec<PeerId>>>,
     pending_request_artifact:
         HashMap<RequestId, oneshot::Sender<Result<Vec<u8>, Box<dyn Error + Send>>>>,
 }
@@ -141,20 +147,22 @@ impl EventLoop {
             swarm,
             command_receiver,
             event_sender,
-            discovered_peers: Default::default(),
             pending_dial: Default::default(),
-            pending_start_providing: Default::default(),
-            pending_get_providers: Default::default(),
+            pending_list_peers: Default::default(),
             pending_request_artifact: Default::default(),
         }
     }
 
     pub async fn run(mut self) {
         loop {
-            tokio::select! {
+            futures::select! {
                 event = self.swarm.next() => self.handle_event(event.expect("Swarm stream to be infinite.")).await  ,
                 command = self.command_receiver.next() => match command {
-                    Some(c) => self.handle_command(c).await,
+                    Some(c) => {
+                        println!("[JSDBG] START HANLDING COMMAND: {:?}", &c);
+                        self.handle_command(c).await;
+                        println!("[JSDBG] END HANDLING COMMAND");
+                    },
                     // Command channel closed, thus shutting down the network event loop.
                     None=>  { println!("GOT NONE COMMAND"); return },
                 },
@@ -164,52 +172,23 @@ impl EventLoop {
 
     async fn handle_event(
         &mut self,
-        event: SwarmEvent<ComposedEvent, EitherError<EitherError<io::Error, void::Void>, ProtocolsHandlerUpgrErr<io::Error>>>,
+        event: SwarmEvent<ComposedEvent, EitherError<io::Error, ProtocolsHandlerUpgrErr<io::Error>>>,
     ) {
         match event {
             SwarmEvent::Behaviour(ComposedEvent::Kademlia(
                 KademliaEvent::OutboundQueryCompleted {
                     id,
-                    result: QueryResult::StartProviding(_),
-                    ..
-                },
-            )) => {
-                let sender: oneshot::Sender<()> = self
-                    .pending_start_providing
-                    .remove(&id)
-                    .expect("Completed query to be previously pending.");
-                let _ = sender.send(());
-            }
-            SwarmEvent::Behaviour(ComposedEvent::Kademlia(
-                KademliaEvent::OutboundQueryCompleted {
-                    id,
-                    result: QueryResult::GetProviders(Ok(GetProvidersOk { providers, .. })),
+                    result: QueryResult::GetClosestPeers(Ok(GetClosestPeersOk { key, peers })),
                     ..
                 },
             )) => {
                 let _ = self
-                    .pending_get_providers
+                    .pending_list_peers
                     .remove(&id)
                     .expect("Completed query to be previously pending.")
-                    .send(providers);
+                    .send(peers);
             }
             SwarmEvent::Behaviour(ComposedEvent::Kademlia(_)) => {}
-            SwarmEvent::Behaviour(ComposedEvent::Mdns(
-                MdnsEvent::Discovered(list)
-            )) => {
-                for (peer, _multiaddr) in list {
-                    self.discovered_peers.insert(peer);
-                }
-            }
-            SwarmEvent::Behaviour(ComposedEvent::Mdns(
-                MdnsEvent::Expired(list)
-            )) => {
-                for (peer, _multiaddr) in list {
-                    if !self.swarm.behaviour_mut().mdns.has_node(&peer) {
-                        self.discovered_peers.remove(&peer);
-                    }
-                }
-            }
             SwarmEvent::Behaviour(ComposedEvent::RequestResponse(
                 RequestResponseEvent::Message { message, .. },
             )) => match message {
@@ -236,6 +215,8 @@ impl EventLoop {
                 }
             },
             SwarmEvent::Behaviour(ComposedEvent::RequestResponse(
+                RequestResponseEvent::InboundFailure { .. })) => {}
+            SwarmEvent::Behaviour(ComposedEvent::RequestResponse(
                 RequestResponseEvent::OutboundFailure {
                     request_id, error, ..
                 },
@@ -256,7 +237,6 @@ impl EventLoop {
                     address.with(Protocol::P2p(local_peer_id.into()))
                 );
             }
-            SwarmEvent::IncomingConnection { .. } => {}
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
@@ -274,7 +254,15 @@ impl EventLoop {
                     }
                 }
             }
-            e => panic!("{:?}", e),
+            SwarmEvent::BannedPeer { .. } => {}
+            SwarmEvent::Dialing(peer_id) => {
+                println!("Local Peer {} is dialing Peer {}...", self.swarm.local_peer_id(), peer_id);
+            }
+            SwarmEvent::ExpiredListenAddr { .. } => {}
+            SwarmEvent::IncomingConnection { .. } => {}
+            SwarmEvent::IncomingConnectionError { .. } => {}
+            SwarmEvent::ListenerClosed { .. } => {}
+            SwarmEvent::ListenerError { .. } => {}
         }
     }
 
@@ -291,9 +279,7 @@ impl EventLoop {
                 peer_addr,
                 sender,
             } => {
-                if self.pending_dial.contains_key(&peer_id) {
-                    todo!("Already dialing peer.");
-                } else {
+                if !self.pending_dial.contains_key(&peer_id) {
                     self.swarm
                         .behaviour_mut()
                         .kademlia
@@ -311,17 +297,21 @@ impl EventLoop {
                     }
                 }
             }
-            // Command::StartProviding { file_name, sender } => {
-            //     let query_id = self
-            //         .swarm
-            //         .behaviour_mut()
-            //         .kademlia
-            //         .start_providing(file_name.into_bytes().into())
-            //         .expect("No store error.");
-            //     self.pending_start_providing.insert(query_id, sender);
-            // }
-            Command::GetPeerIds { sender } => {
-                let _ = sender.send(self.discovered_peers.clone());
+            Command::ListPeers {
+                peer_id,
+                sender,
+            } => {
+                let query_id = self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .get_closest_peers(peer_id);
+                self.pending_list_peers.insert(query_id, sender);
+            }
+            Command::LookupBlob {
+                hash,
+                sender,
+            } => {
+                sender.send(Ok(())).expect("Connection to peer to still be open.");
             }
             Command::RequestArtifact {
                 hash,
@@ -350,26 +340,18 @@ impl EventLoop {
 #[behaviour(out_event = "ComposedEvent")]
 struct ComposedBehaviour {
     kademlia: Kademlia<MemoryStore>,
-    mdns: Mdns,
     request_response: RequestResponse<FileExchangeCodec>,
 }
 
 #[derive(Debug)]
 enum ComposedEvent {
     Kademlia(KademliaEvent),
-    Mdns(MdnsEvent),
     RequestResponse(RequestResponseEvent<ArtifactRequest, ArtifactResponse>),
 }
 
 impl From<KademliaEvent> for ComposedEvent {
     fn from(event: KademliaEvent) -> Self {
         ComposedEvent::Kademlia(event)
-    }
-}
-
-impl From<MdnsEvent> for ComposedEvent {
-    fn from(event: MdnsEvent) -> Self {
-        ComposedEvent::Mdns(event)
     }
 }
 
@@ -390,8 +372,13 @@ enum Command {
         peer_addr: Multiaddr,
         sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>,
     },
-    GetPeerIds {
-        sender: oneshot::Sender<HashSet<PeerId>>,
+    ListPeers {
+        peer_id: PeerId,
+        sender: oneshot::Sender<Vec<PeerId>>,
+    },
+    LookupBlob {
+        hash: String,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>,
     },
     RequestArtifact {
         hash: String,

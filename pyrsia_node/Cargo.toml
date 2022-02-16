@@ -9,6 +9,7 @@ edition = "2021"
 pyrsia = { path = ".." }
 signed_struct = { path = "../src/signed_struct" } # Explict dep for proc-macro, see https://github.com/pyrsia/pyrsia/issues/110
 
+async-std = "1.10.0"
 clap = { version = "3.0.14", features= ["cargo"] }
 hex = "0.4.3"
 log = "0.4.14"

@@ -3896,6 +3896,7 @@ dependencies = [
 name = "pyrsia_node"
 version = "0.1.0"
 dependencies = [
+ "async-std",
  "clap 3.0.14",
  "futures",
  "hex",

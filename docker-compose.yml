@@ -15,7 +15,7 @@ services:
     build:
       context: .
       target: node
-    command: ["-H" , "0.0.0.0", "-p", "7889"]
+    command: ["-H" , "0.0.0.0", "-p", "7889", "-P", "${PEER_ID}"]
     stdin_open: true
     ports:
       - "7889:7889"

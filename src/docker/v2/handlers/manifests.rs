@@ -21,6 +21,7 @@ use super::HashAlgorithm;
 use crate::docker::docker_hub_util::get_docker_hub_auth_token;
 use crate::docker::error_util::{RegistryError, RegistryErrorCode};
 use crate::metadata_manager::metadata::MetadataCreationStatus;
+use crate::network::p2p;
 use crate::node_manager::handlers::METADATA_MGR;
 use crate::node_manager::model::artifact::{Artifact, ArtifactBuilder};
 use crate::node_manager::model::package_type::PackageTypeName;
@@ -30,6 +31,7 @@ use anyhow::{anyhow, bail, Context};
 use bytes::Buf;
 use bytes::Bytes;
 use easy_hasher::easy_hasher::raw_sha512;
+use libp2p::PeerId;
 use log::{debug, error, info, warn};
 use reqwest::{header, Client};
 use serde_json::{json, Map, Value};
@@ -60,44 +62,21 @@ pub async fn handle_get_manifests(name: String, tag: String) -> Result<impl Repl
                     //TODO: neeed mechanism in metadata to delete the invalid metadata
                     error!("Bad metadata in pyrsia , getting manifest from dockerhub");
 
-                    let hash = get_manifest_from_docker_hub(&name, &tag).await?;
-                    manifest_content =
-                        get_artifact(hex::decode(hash).unwrap().as_ref(), HashAlgorithm::SHA512)
-                            .map_err(|_| {
-                                warp::reject::custom(RegistryError {
-                                    code: RegistryErrorCode::ManifestUnknown,
-                                })
-                            })?;
+                    manifest_content = get_manifest_content_from_elsewhere(&name, &tag).await?;
                 }
             }
         }
         Ok(None) => {
-            debug!("No package found in pyrsia , getting manifest from dockerhub and storing in pyrsia.");
+            debug!("No package found in pyrsia, getting manifest from dockerhub and storing in pyrsia.");
 
-            let hash = get_manifest_from_docker_hub(&name, &tag).await?;
-            manifest_content =
-                get_artifact(hex::decode(hash).unwrap().as_ref(), HashAlgorithm::SHA512).map_err(
-                    |_| {
-                        warp::reject::custom(RegistryError {
-                            code: RegistryErrorCode::ManifestUnknown,
-                        })
-                    },
-                )?;
+            manifest_content = get_manifest_content_from_elsewhere(&name, &tag).await?;
         }
 
         Err(_error) => {
             error!("Error getting manifest from pyrsia");
             debug!("Getting manifest from dockerhub and storing in pyrsia storage.");
 
-            let hash = get_manifest_from_docker_hub(&name, &tag).await?;
-            manifest_content =
-                get_artifact(hex::decode(hash).unwrap().as_ref(), HashAlgorithm::SHA512).map_err(
-                    |_| {
-                        warp::reject::custom(RegistryError {
-                            code: RegistryErrorCode::ManifestUnknown,
-                        })
-                    },
-                )?;
+            manifest_content = get_manifest_content_from_elsewhere(&name, &tag).await?;
         }
     };
 
@@ -221,17 +200,66 @@ fn sign_and_save_package_version(
     Ok(())
 }
 
-async fn get_manifest_from_docker_hub(name: &str, tag: &str) -> Result<String, Rejection> {
+async fn get_manifest_content_from_elsewhere(/*p2p_client: p2p::Client, peer_id: Option<PeerId>, */name: &String, tag: &str) -> Result<Vec<u8>, Rejection> {
+    // if let Some(peer_id) = peer_id {
+    //     if let Ok(data) = get_manifest_from_peer(p2p_client.clone(), peer_id, &name, &tag).await {
+    //         return Ok(data);
+    //     }
+    // }
+
+    get_manifest_from_docker_hub(&name, &tag).await
+}
+
+async fn get_manifest_from_peer(mut p2p_client: p2p::Client, peer_id: PeerId, name: &String, tag: &str) -> Result<Vec<u8>, Rejection> {
+    let url = format!(
+        "https://registry-1.docker.io/v2/library/{}/manifests/{}",
+        name, tag
+    );
+
+    let file = p2p_client.request_artifact(peer_id, url.clone())
+        .await
+        .map_err(|_| warp::reject::custom(RegistryError {
+            code: RegistryErrorCode::ManifestUnknown,
+        }))?;
+
+    debug!("Storing manifest pulled from pyrsia peer in artifact manager");
+    let hash = store_manifest(name, tag, Bytes::from(file))?;
+
+    let manifest_content =
+        get_artifact(hex::decode(&hash).unwrap().as_ref(), HashAlgorithm::SHA512)
+            .map_err(|_| {
+                warp::reject::custom(RegistryError {
+                    code: RegistryErrorCode::ManifestUnknown,
+                })
+            })?;
+
+    Ok(manifest_content)
+}
+
+async fn get_manifest_from_docker_hub(name: &str, tag: &str) -> Result<Vec<u8>, Rejection> {
     let token = get_docker_hub_auth_token(name).await?;
 
-    get_manifest_from_docker_hub_with_token(name, tag, token).await
+    let bytes = get_manifest_from_docker_hub_with_token(name, tag, token).await?;
+
+    debug!("Storing manifest pulled from dockerHub in artifact manager");
+    let hash = store_manifest(name, tag, bytes)?;
+
+    let manifest_content =
+        get_artifact(hex::decode(&hash).unwrap().as_ref(), HashAlgorithm::SHA512)
+            .map_err(|_| {
+                warp::reject::custom(RegistryError {
+                    code: RegistryErrorCode::ManifestUnknown,
+                })
+            })?;
+
+    Ok(manifest_content)
 }
 
 async fn get_manifest_from_docker_hub_with_token(
     name: &str,
     tag: &str,
     token: String,
-) -> Result<String, Rejection> {
+) -> Result<Bytes, Rejection> {
     let url = format!(
         "https://registry-1.docker.io/v2/library/{}/manifests/{}",
         name, tag
@@ -254,10 +282,28 @@ async fn get_manifest_from_docker_hub_with_token(
         response.status()
     );
 
-    let bytes = response.bytes().await.map_err(RegistryError::from)?;
+    response.bytes().await.map_err(|_| warp::reject::custom(RegistryError {
+        code: RegistryErrorCode::ManifestUnknown,
+    }))
+}
 
-    debug!("Storing manifest pulled from dockerHub in artifact manager");
+fn get_artifact_manifest(artifacts: &[Artifact]) -> Option<&Artifact> {
+    for artifact in artifacts {
+        if let Some(mime_type) = artifact.mime_type() {
+            debug!("mime type is: {}", mime_type);
+            if mime_type.eq(MEDIA_TYPE_SCHEMA_1)
+                || mime_type.eq(MEDIA_TYPE_IMAGE_MANIFEST)
+                || mime_type.eq(MEDIA_TYPE_MANIFEST_LIST)
+            {
+                debug!("found where mime type is: {}", mime_type);
+                return Some(artifact);
+            }
+        }
+    }
+    None
+}
 
+fn store_manifest(name: &str, tag: &str, bytes: Bytes) -> Result<String, Rejection> {
     let mut hash = String::new();
     match store_manifest_in_artifact_manager(bytes.clone()) {
         Ok(artifact_hash) => {
@@ -296,22 +342,6 @@ async fn get_manifest_from_docker_hub_with_token(
         Err(error) => warn!("Error storing manifest in artifact_manager {}", error),
     };
     Ok(hash)
-}
-
-fn get_artifact_manifest(artifacts: &[Artifact]) -> Option<&Artifact> {
-    for artifact in artifacts {
-        if let Some(mime_type) = artifact.mime_type() {
-            debug!("mime type is: {}", mime_type);
-            if mime_type.eq(MEDIA_TYPE_SCHEMA_1)
-                || mime_type.eq(MEDIA_TYPE_IMAGE_MANIFEST)
-                || mime_type.eq(MEDIA_TYPE_MANIFEST_LIST)
-            {
-                debug!("found where mime type is: {}", mime_type);
-                return Some(artifact);
-            }
-        }
-    }
-    None
 }
 
 fn store_manifest_in_artifact_manager(bytes: Bytes) -> anyhow::Result<(HashAlgorithm, Vec<u8>)> {
