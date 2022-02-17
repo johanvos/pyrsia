@@ -167,7 +167,7 @@ impl EventLoop {
                 event = self.swarm.next() => self.handle_event(event.expect("Swarm stream to be infinite.")).await  ,
                 command = self.command_receiver.next() => match command {
                     Some(c) => {
-                        println!("[JSDBG] START HANLDING COMMAND: {:?}", &c);
+                        println!("[JSDBG] START HANDLING COMMAND");
                         self.handle_command(c).await;
                         println!("[JSDBG] END HANDLING COMMAND");
                     },
@@ -340,6 +340,7 @@ impl EventLoop {
                 self.pending_request_artifact.insert(request_id, sender);
             }
             Command::RespondArtifact { artifact, channel } => {
+                println!("I will handle RespondArtifact!");
                 self.swarm
                     .behaviour_mut()
                     .request_response
@@ -446,7 +447,7 @@ impl RequestResponseCodec for FileExchangeCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let vec = read_length_prefixed(io, 1_000_000).await?;
+        let vec = read_length_prefixed(io, 100_000_000).await?;
 
         if vec.is_empty() {
             return Err(io::ErrorKind::UnexpectedEof.into());
@@ -463,7 +464,7 @@ impl RequestResponseCodec for FileExchangeCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let vec = read_length_prefixed(io, 1_000_000).await?;
+        let vec = read_length_prefixed(io, 100_000_000).await?;
 
         if vec.is_empty() {
             return Err(io::ErrorKind::UnexpectedEof.into());

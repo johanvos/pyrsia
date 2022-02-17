@@ -40,10 +40,21 @@ lazy_static! {
     pub static ref LOCAL_PEER_ID: PeerId = PeerId::from(LOCAL_KEY.public());
     pub static ref MEMORY_STORE: MemoryStore = MemoryStore::new(*LOCAL_PEER_ID);
     pub static ref KADEMLIA_PROXY: KademliaThreadSafeProxy = KademliaThreadSafeProxy::default();
-    pub static ref ARTIFACTS_DIR: String = log_static_initialization_failure(
-        "Pyrsia Artifact directory",
-        Ok(read_var("PYRSIA_ARTIFACT_PATH", "pyrsia"))
-    );
+    pub static ref ARTIFACTS_DIR: String = {
+        let dev_mode = read_var("DEV_MODE", "off");
+        let artifact_path = read_var("PYRSIA_ARTIFACT_PATH", "pyrsia");
+        if dev_mode.to_lowercase() == "on" {
+            log_static_initialization_failure(
+                "Artifact Manager Directory",
+                fs::create_dir_all(artifact_path.as_str())
+                    .with_context(|| "Failed to create artifact manager directory in dev mode"),
+            );
+        }
+        log_static_initialization_failure(
+            "Pyrsia Artifact directory",
+            Ok(artifact_path)
+        )
+    };
     pub static ref ART_MGR: ArtifactManager = {
         let dev_mode = read_var("DEV_MODE", "off");
         if dev_mode.to_lowercase() == "on" {

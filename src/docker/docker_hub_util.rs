@@ -24,7 +24,7 @@ struct Bearer {
     expires_in: u64,
 }
 
-pub async fn get_docker_hub_auth_token(name: &str) -> Result<String, warp::Rejection> {
+pub async fn get_docker_hub_auth_token(name: &str) -> Result<String, RegistryError> {
     let auth_url = format!("https://auth.docker.io/token?client_id=Pyrsia&service=registry.docker.io&scope=repository:library/{}:pull", name);
 
     let token: Bearer = get(auth_url)
