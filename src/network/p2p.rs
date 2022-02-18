@@ -23,6 +23,7 @@ use libp2p::core::{Multiaddr, PeerId};
 use libp2p::core::either::EitherError;
 use libp2p::core::upgrade::{read_length_prefixed, write_length_prefixed, ProtocolName};
 use libp2p::identity;
+use libp2p::identity::ed25519;
 use libp2p::kad::{GetClosestPeersOk, Kademlia, KademliaEvent, QueryId, QueryResult};
 use libp2p::kad::record::store::MemoryStore;
 use libp2p::multiaddr::Protocol;
@@ -36,9 +37,17 @@ use std::error::Error;
 use std::iter;
 
 pub async fn new() -> Result<(Client, impl Stream<Item = Event>, EventLoop), Box<dyn Error>> {
-    let local_keys = identity::Keypair::generate_ed25519();
+    let mut bytes = [0u8; 32];
+    bytes[0] = 0x1;
+    let secret_key = ed25519::SecretKey::from_bytes(&mut bytes).expect(
+                    "this returns `Err` only if the length is wrong; the length is correct; qed",
+                );
+    let local_keys = identity::Keypair::Ed25519(secret_key.into());
+
+    // let local_keys = identity::Keypair::generate_ed25519();
 
     let local_peer_id = local_keys.public().to_peer_id();
+    println!("[JVDBG] local_peer_id = {}", local_peer_id);
 
     let swarm = SwarmBuilder::new(
         libp2p::development_transport(local_keys).await?,

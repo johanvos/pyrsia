@@ -330,6 +330,7 @@ pub async fn get_blob_from_local(hash: &str) -> Result<Vec<u8>, RegistryError> {
 }
 
 async fn get_blob_from_elsewhere(p2p_client: p2p::Client, peer_id: Option<PeerId>, name: &str, hash: &str) -> Result<bool, Rejection> {
+println!("Do we have a peer id? {:?}", peer_id);
     Ok(match peer_id {
         Some(peer) => get_blob_from_other_peer(p2p_client.clone(), peer, name, hash).await,
         None => get_blob_from_docker_hub(name, hash).await?
@@ -338,6 +339,7 @@ async fn get_blob_from_elsewhere(p2p_client: p2p::Client, peer_id: Option<PeerId
 
 // Request the content of the artifact from other peer
 async fn get_blob_from_other_peer(mut p2p_client: p2p::Client, peer_id: PeerId, name: &str, hash: &str) -> bool {
+println!("GETBLOBFROMOTHERPEER: Reading blob from Pyrsia Node {}: {}", peer_id, hash.get(7..).unwrap());
     info!("Reading blob from Pyrsia Node {}: {}", peer_id, hash.get(7..).unwrap());
     let artifact = p2p_client.request_artifact(peer_id, String::from(hash)).await.unwrap();
     match write_blob_to_local(hash, bytes::Bytes::from(artifact)).await {
@@ -375,6 +377,7 @@ async fn get_blob_from_other_peer(mut p2p_client: p2p::Client, peer_id: PeerId, 
 }
 
 async fn get_blob_from_docker_hub(name: &str, hash: &str) -> Result<bool, RegistryError> {
+println!("GET_BLOB_FROM_DOCKER: {}", hash);
     let token = get_docker_hub_auth_token(name).await?;
 
     get_blob_from_docker_hub_with_token(name, hash, token).await

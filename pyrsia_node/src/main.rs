@@ -106,6 +106,7 @@ async fn main() {
             Some(Protocol::P2p(hash)) => Ok(PeerId::from_multihash(hash).expect("Valid hash.")),
             _ => Err("Expect peer multiaddr to contain peer ID."),
         };
+println!("PEER! {:?}", peer_id);
         match peer_id {
             Ok(peer_id) => {
                 final_peer_id = Some(peer_id);
@@ -114,13 +115,18 @@ async fn main() {
             },
             Err(e) => error!("Failed to dial peer: {}", e)
         };
+        p2p_client
+            .listen("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+            .await
+            .expect("Listening should not fail");
+    } else {
+        // Listen on all interfaces and whatever port the OS assigns
+        p2p_client
+            .listen("/ip4/0.0.0.0/tcp/12345".parse().unwrap())
+            .await
+            .expect("Listening should not fail");
     }
 
-    // Listen on all interfaces and whatever port the OS assigns
-    p2p_client
-        .listen("/ip4/0.0.0.0/tcp/0".parse().unwrap())
-        .await
-        .expect("Listening should not fail");
 
     // Get host and port from the settings. Defaults to DEFAULT_HOST and DEFAULT_PORT
     let host = matches.value_of("host").unwrap();
@@ -142,7 +148,7 @@ async fn main() {
         routes
             .and(http::log_headers())
             .recover(custom_recover)
-            .with(warp::log("pyrsia_registry")),
+            .with(warp::log("PYRsia_registry")),
     )
     .bind_ephemeral(address);
 
