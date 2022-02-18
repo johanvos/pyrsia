@@ -318,7 +318,7 @@ async fn write_blob_to_local(hash: &str, bytes: Bytes) -> Result<bool, RegistryE
     Ok(true)
 }
 
-async fn get_blob_from_local(hash: &str) -> Result<Vec<u8>, RegistryError> {
+pub async fn get_blob_from_local(hash: &str) -> Result<Vec<u8>, RegistryError> {
     let mut base_path: PathBuf = PathBuf::from(ARTIFACTS_DIR.as_str());
     base_path.push(hash.get(7..).unwrap());
     base_path.set_extension("file");

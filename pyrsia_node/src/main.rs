@@ -25,6 +25,7 @@ extern crate warp;
 
 use pyrsia::artifact_manager::HashAlgorithm;
 use pyrsia::docker::error_util::*;
+use pyrsia::docker::v2::handlers::blobs::get_blob_from_local;
 use pyrsia::docker::v2::routes::*;
 use pyrsia::logging::*;
 use pyrsia::network::p2p::{self};
@@ -158,12 +159,9 @@ async fn main() {
             match event {
                 // Reply with the content of the artifact on incoming requests.
                 pyrsia::network::p2p::Event::InboundRequest { hash, channel } => {
-                    match get_artifact(
-                        hex::decode(&hash.get(7..).unwrap()).unwrap().as_ref(),
-                        HashAlgorithm::SHA256,
-                    ) {
+                    match get_blob_from_local(&hash).await {
                         Ok(content) => p2p_client.respond_artifact(content, channel).await,
-                        _ => info!("This node does not provide artifact {}", hash),
+                        Err(e) => info!("This node does not provide artifact {}. Error: {:?}", hash, e),
                     }
                 }
             }
